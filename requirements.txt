@@ -1,0 +1,6 @@
+Django>=5.2,<6.1
+django-jazzmin==3.0.1
+psycopg[binary]>=3.2
+requests>=2.32
+python-dotenv>=1.0
+starkbank-ecdsa>=2.2.0

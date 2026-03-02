@@ -1,0 +1,360 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Integration Tester | {{ site_title|default:_("Django site admin") }}{% endblock %}
+
+{% block breadcrumbs %}
+<ol class="breadcrumb float-sm-right">
+  <li class="breadcrumb-item"><a href="{% url 'admin:index' %}">Home</a></li>
+  <li class="breadcrumb-item active">Integration Tester</li>
+</ol>
+{% endblock %}
+
+{% block extrastyle %}
+  {{ block.super }}
+  <style>
+    .tester-page .small-note {
+      color: #5f6b84;
+      margin-bottom: 1rem;
+    }
+
+    .tester-page .status {
+      font-weight: 700;
+      margin-bottom: 8px;
+    }
+
+    .tester-page .status.ok {
+      color: #067647;
+    }
+
+    .tester-page .status.fail {
+      color: #b42318;
+    }
+
+    .tester-page #channelHints {
+      margin-top: 6px;
+      color: #5f6b84;
+      font-size: 12px;
+    }
+
+    .tester-page pre {
+      background: #0f172a;
+      color: #e2e8f0;
+      border-radius: 8px;
+      padding: 12px;
+      overflow: auto;
+      min-height: 320px;
+      margin: 0;
+      font-size: 12px;
+      line-height: 1.5;
+    }
+
+    .tester-page textarea {
+      min-height: 110px;
+      resize: vertical;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+  </style>
+{% endblock %}
+
+{% block content %}
+<div class="tester-page">
+  <h1>Integration Tester</h1>
+  <p class="small-note">
+    Test mediator channels directly from the browser. Requests are sent to this mediator and forwarded based on configured channels.
+  </p>
+
+  <div class="row">
+    <div class="col-lg-6">
+      <div class="card card-primary card-outline">
+        <div class="card-header">
+          <h3 class="card-title">Request</h3>
+        </div>
+        <div class="card-body">
+          <div class="form-group">
+            <label for="channelSelect">Channel</label>
+            <select id="channelSelect" class="form-control"></select>
+            <div id="channelHints"></div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group col-md-6">
+              <label for="methodSelect">Method</label>
+              <select id="methodSelect" class="form-control"></select>
+            </div>
+            <div class="form-group col-md-6">
+              <label for="pathInput">Path</label>
+              <input id="pathInput" class="form-control" type="text" placeholder="/integrations/teachers">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="queryInput">Query String (optional)</label>
+            <input id="queryInput" class="form-control" type="text" placeholder="sync=true">
+          </div>
+
+          <div class="form-group">
+            <label for="clientSelect">Client</label>
+            <select id="clientSelect" class="form-control"></select>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group col-md-6">
+              <label for="clientIdInput">X-Client-Id</label>
+              <input id="clientIdInput" class="form-control" type="text">
+            </div>
+            <div class="form-group col-md-6">
+              <label for="clientSecretInput">X-Client-Secret</label>
+              <input id="clientSecretInput" class="form-control" type="text">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="extraHeadersInput">Extra Headers (one per line, <code>Key: Value</code>)</label>
+            <textarea id="extraHeadersInput" class="form-control" placeholder="Accept: application/json"></textarea>
+          </div>
+
+          <div class="form-group">
+            <label for="bodyInput">Body</label>
+            <textarea id="bodyInput" class="form-control" placeholder='{"teacher_id":"T-1"}'></textarea>
+          </div>
+        </div>
+        <div class="card-footer">
+          <button id="sendBtn" class="btn btn-primary">Send Request</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="col-lg-6">
+      <div class="card card-secondary card-outline">
+        <div class="card-header">
+          <h3 class="card-title">Response</h3>
+        </div>
+        <div class="card-body">
+          <div id="statusLine" class="status">Ready</div>
+          <pre id="responseOutput">No request sent yet.</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+{{ channels_payload|json_script:"channels-data" }}
+{{ clients_payload|json_script:"clients-data" }}
+
+<script>
+  const channels = JSON.parse(document.getElementById("channels-data").textContent);
+  const clients = JSON.parse(document.getElementById("clients-data").textContent);
+
+  const channelSelect = document.getElementById("channelSelect");
+  const methodSelect = document.getElementById("methodSelect");
+  const pathInput = document.getElementById("pathInput");
+  const queryInput = document.getElementById("queryInput");
+  const clientSelect = document.getElementById("clientSelect");
+  const clientIdInput = document.getElementById("clientIdInput");
+  const clientSecretInput = document.getElementById("clientSecretInput");
+  const extraHeadersInput = document.getElementById("extraHeadersInput");
+  const bodyInput = document.getElementById("bodyInput");
+  const sendBtn = document.getElementById("sendBtn");
+  const statusLine = document.getElementById("statusLine");
+  const responseOutput = document.getElementById("responseOutput");
+  const channelHints = document.getElementById("channelHints");
+
+  function renderChannelOptions() {
+    channelSelect.innerHTML = "";
+    if (!channels.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No active channels";
+      channelSelect.appendChild(opt);
+      return;
+    }
+
+    channels.forEach((channel, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      opt.textContent = `${channel.name} [${channel.mediator_name}]`;
+      channelSelect.appendChild(opt);
+    });
+    channelSelect.value = "0";
+    applyChannelSelection();
+  }
+
+  function applyChannelSelection() {
+    if (!channels.length) {
+      methodSelect.innerHTML = "";
+      pathInput.value = "";
+      return;
+    }
+
+    const channel = channels[Number(channelSelect.value)] || channels[0];
+    const methods = channel.methods.length ? channel.methods : ["get", "post", "put", "patch", "delete"];
+
+    methodSelect.innerHTML = "";
+    methods.forEach((method) => {
+      const opt = document.createElement("option");
+      opt.value = method.toUpperCase();
+      opt.textContent = method.toUpperCase();
+      methodSelect.appendChild(opt);
+    });
+
+    pathInput.value = channel.path_pattern;
+
+    const hints = [];
+    if (channel.requires_request_body) {
+      hints.push("Body required");
+    }
+    if (channel.request_content_type) {
+      hints.push(`Expected Content-Type: ${channel.request_content_type}`);
+    }
+    channelHints.textContent = hints.join(" | ");
+
+    const currentExtraHeaders = parseExtraHeaders(extraHeadersInput.value);
+    if (channel.request_content_type && !currentExtraHeaders["Content-Type"]) {
+      extraHeadersInput.value = `Content-Type: ${channel.request_content_type}`;
+    }
+    if (channel.request_body_example && !bodyInput.value.trim()) {
+      bodyInput.value = channel.request_body_example;
+    }
+  }
+
+  function renderClientOptions() {
+    clientSelect.innerHTML = "";
+    if (!clients.length) {
+      const opt = document.createElement("option");
+      opt.value = "";
+      opt.textContent = "No active clients";
+      clientSelect.appendChild(opt);
+      return;
+    }
+
+    clients.forEach((client, idx) => {
+      const opt = document.createElement("option");
+      opt.value = String(idx);
+      opt.textContent = `${client.name} (${client.client_id})`;
+      clientSelect.appendChild(opt);
+    });
+
+    clientSelect.value = "0";
+    applyClientSelection();
+  }
+
+  function applyClientSelection() {
+    if (!clients.length) {
+      clientIdInput.value = "";
+      clientSecretInput.value = "";
+      return;
+    }
+
+    const client = clients[Number(clientSelect.value)] || clients[0];
+    clientIdInput.value = client.client_id;
+    clientSecretInput.value = client.client_secret;
+  }
+
+  function parseExtraHeaders(raw) {
+    const headers = {};
+    raw.split("\n").forEach((line) => {
+      const trimmed = line.trim();
+      if (!trimmed) {
+        return;
+      }
+      const idx = trimmed.indexOf(":");
+      if (idx <= 0) {
+        return;
+      }
+      const key = trimmed.slice(0, idx).trim();
+      const val = trimmed.slice(idx + 1).trim();
+      if (key) {
+        headers[key] = val;
+      }
+    });
+    return headers;
+  }
+
+  async function sendRequest() {
+    const method = methodSelect.value || "GET";
+    let path = pathInput.value.trim();
+    const query = queryInput.value.trim();
+
+    if (!path) {
+      statusLine.textContent = "Path is required";
+      statusLine.className = "status fail";
+      return;
+    }
+    if (!path.startsWith("/")) {
+      path = `/${path}`;
+    }
+
+    const url = query ? `${path}?${query}` : path;
+    const body = bodyInput.value;
+
+    const headers = {
+      "X-Client-Id": clientIdInput.value.trim(),
+      "X-Client-Secret": clientSecretInput.value.trim(),
+    };
+
+    Object.assign(headers, parseExtraHeaders(extraHeadersInput.value));
+
+    if (!["GET", "HEAD"].includes(method) && body && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+
+    sendBtn.disabled = true;
+    statusLine.textContent = "Sending...";
+    statusLine.className = "status";
+
+    const started = performance.now();
+
+    try {
+      const response = await fetch(url, {
+        method,
+        headers,
+        body: ["GET", "HEAD"].includes(method) ? undefined : body,
+      });
+
+      const elapsedMs = Math.round(performance.now() - started);
+      const text = await response.text();
+      let parsedBody = text;
+
+      try {
+        parsedBody = JSON.stringify(JSON.parse(text), null, 2);
+      } catch (_err) {
+        // Keep raw text if it is not JSON.
+      }
+
+      const responseHeaders = {};
+      response.headers.forEach((value, key) => {
+        responseHeaders[key] = value;
+      });
+
+      statusLine.textContent = `${response.status} ${response.statusText} in ${elapsedMs}ms`;
+      statusLine.className = response.ok ? "status ok" : "status fail";
+
+      responseOutput.textContent = [
+        "Request",
+        `- URL: ${url}`,
+        `- Method: ${method}`,
+        `- Correlation ID: ${response.headers.get("x-correlation-id") || "(none)"}`,
+        "",
+        "Response Headers",
+        JSON.stringify(responseHeaders, null, 2),
+        "",
+        "Response Body",
+        parsedBody || "",
+      ].join("\n");
+    } catch (err) {
+      statusLine.textContent = "Request failed";
+      statusLine.className = "status fail";
+      responseOutput.textContent = String(err);
+    } finally {
+      sendBtn.disabled = false;
+    }
+  }
+
+  channelSelect.addEventListener("change", applyChannelSelection);
+  clientSelect.addEventListener("change", applyClientSelection);
+  sendBtn.addEventListener("click", sendRequest);
+
+  renderChannelOptions();
+  renderClientOptions();
+</script>
+{% endblock %}

@@ -42,6 +42,12 @@ TERMINAL_TRANSACTION_STATUSES = {
     Transaction.Status.SUCCESSFUL,
     Transaction.Status.FAILED,
 }
+UPSTREAM_NETWORK_EXCEPTIONS = (
+    urllib.error.URLError,
+    TimeoutError,
+    socket.timeout,
+    ConnectionError,
+)
 
 
 @swagger_doc(
@@ -59,6 +65,7 @@ def api_root(_request):
                 "admin": "/admin/",
                 "health": "/health/",
                 "tester": "/tester/",
+                "integration_call": "/integration/call",
                 "transaction_status": "/transactions/<correlation_id>/",
             },
         }
@@ -283,6 +290,29 @@ def _build_target_url(channel, request):
     return url
 
 
+def _build_target_url_from_parts(channel, path, query_params):
+    base_url = channel.mediator.endpoint_url.rstrip("/")
+    normalized_path = str(path or "").strip()
+    if not normalized_path.startswith("/"):
+        normalized_path = f"/{normalized_path}"
+    url = f"{base_url}{normalized_path}"
+
+    filtered_query = []
+    if isinstance(query_params, dict):
+        for key, value in query_params.items():
+            if str(key).lower() == "async":
+                continue
+            if isinstance(value, (list, tuple)):
+                for item in value:
+                    filtered_query.append((str(key), str(item)))
+            else:
+                filtered_query.append((str(key), str(value)))
+
+    if filtered_query:
+        url = f"{url}?{urlencode(filtered_query, doseq=True)}"
+    return url
+
+
 def _proxy_headers_from_mapping(source_headers, correlation_id):
     headers = {}
     for key, value in source_headers.items():
@@ -475,7 +505,7 @@ def _process_transaction_in_background(
             response_status_code = exc.code
             response_headers = dict(exc.headers.items()) if exc.headers else {}
             response_body = exc.read()
-        except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+        except UPSTREAM_NETWORK_EXCEPTIONS as exc:
             transaction.status = Transaction.Status.FAILED
             transaction.response_status_code = 502
             transaction.error_message = str(exc)
@@ -530,7 +560,7 @@ def _is_pure_esb_mode():
     return (settings.MEDIATOR_MODE or "hybrid").strip().lower() == "pure_esb"
 
 
-def _resolve_external_registration(request, channel=None):
+def _resolve_external_registration(request, channel=None, organization_override=""):
     registrations = ExternalSystemRegistration.objects.filter(is_active=True)
     if channel is not None:
         registrations = registrations.filter(channel=channel)
@@ -538,7 +568,9 @@ def _resolve_external_registration(request, channel=None):
             return None, None
 
     organization = (
-        request.headers.get("X-Organization") or request.GET.get("organization", "")
+        str(organization_override).strip()
+        or request.headers.get("X-Organization")
+        or request.GET.get("organization", "")
     ).strip()
     if not organization:
         return None, JsonResponse(
@@ -639,9 +671,11 @@ def _build_esb_payload(request_body):
     return {"requestdata": requestdata}
 
 
-def _resolve_esb_mode_and_code(request, registration):
+def _resolve_esb_mode_and_code(request, registration, esb_mode_override=""):
     preferred_mode = (
-        request.headers.get("X-ESB-Mode") or request.GET.get("esb_mode", "")
+        str(esb_mode_override).strip()
+        or request.headers.get("X-ESB-Mode")
+        or request.GET.get("esb_mode", "")
     ).strip().lower()
 
     if preferred_mode not in {"", "normal", "push"}:
@@ -692,6 +726,506 @@ def _normalize_esb_response(response):
 
     normalized = str(response)
     return {"raw_response": normalized}, normalized
+
+
+def _parse_json_object_body(request):
+    try:
+        payload = json.loads((request.body or b"{}").decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        raise ValueError("Invalid JSON body")
+
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+    return payload
+
+
+def _as_request_body_bytes(value, content_type):
+    if value is None:
+        return b""
+    if isinstance(value, (dict, list)):
+        return json.dumps(value).encode("utf-8")
+    if isinstance(value, str):
+        return value.encode("utf-8")
+    if content_type and "json" in content_type.lower():
+        return json.dumps(value).encode("utf-8")
+    return str(value).encode("utf-8")
+
+
+@swagger_doc(
+    methods=["post"],
+    summary="Call integration by channel id",
+    description=(
+        "Wrapper endpoint to invoke a configured channel using channel_id and body payload."
+    ),
+    tags=["Mediator Proxy"],
+    security=[{"BasicAuth": []}, {"XClientId": [], "XClientSecret": []}],
+    request_body={
+        "required": True,
+        "content": {
+            "application/json": {
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "channel_id": {"type": "integer"},
+                        "method": {"type": "string"},
+                        "path": {"type": "string"},
+                        "query": {"type": "object"},
+                        "body": {},
+                        "headers": {"type": "object"},
+                        "content_type": {"type": "string"},
+                        "async": {"type": "boolean"},
+                        "organization": {"type": "string"},
+                        "esb_mode": {"type": "string", "enum": ["normal", "push"]},
+                    },
+                    "required": ["channel_id", "body"],
+                },
+                "example": {
+                    "channel_id": 1,
+                    "method": "POST",
+                    "path": "/demo/teachers/license/renew",
+                    "query": {"source": "lms", "async": False},
+                    "body": {"teacher_id": "TTPB-DEMO-1001", "renewal_year": 2026},
+                    "headers": {"X-Request-Source": "integration-wrapper"},
+                    "content_type": "application/json",
+                    "organization": "MOEST",
+                },
+            }
+        },
+    },
+    responses={
+        "200": {"description": "Synchronous proxy success"},
+        "202": {"description": "Accepted for asynchronous processing"},
+        "400": {"description": "Validation error"},
+        "401": {"description": "Authentication required"},
+        "403": {"description": "Forbidden"},
+        "404": {"description": "Channel not found"},
+        "405": {"description": "Method not allowed"},
+        "415": {"description": "Unsupported media type"},
+        "502": {"description": "Upstream or ESB relay failure"},
+        "503": {"description": "Mediator offline"},
+    },
+)
+@csrf_exempt
+def integration_call(request):
+    if request.method.upper() != "POST":
+        return JsonResponse({"ok": False, "error": "Method not allowed"}, status=405)
+
+    client, auth_error = _authenticate_client(request)
+    if auth_error is not None:
+        return auth_error
+
+    try:
+        payload = _parse_json_object_body(request)
+    except ValueError as exc:
+        return JsonResponse({"ok": False, "error": str(exc)}, status=400)
+
+    channel_id = payload.get("channel_id")
+    try:
+        channel_id = int(channel_id)
+    except (TypeError, ValueError):
+        return JsonResponse({"ok": False, "error": "channel_id must be an integer"}, status=400)
+
+    channel = (
+        Channel.objects.select_related("mediator")
+        .filter(id=channel_id, is_active=True)
+        .first()
+    )
+    if channel is None:
+        return JsonResponse({"ok": False, "error": "Channel not found"}, status=404)
+    if not channel.mediator.is_online:
+        return JsonResponse({"ok": False, "error": "Matched mediator is offline"}, status=503)
+
+    method = str(
+        payload.get("method")
+        or (channel.methods[0] if channel.methods else "POST")
+    ).strip().upper()
+    if channel.methods and method.lower() not in {m.lower() for m in channel.methods}:
+        return JsonResponse({"ok": False, "error": "Method not allowed for this channel"}, status=405)
+
+    resource_path = str(payload.get("path") or channel.path_pattern).strip()
+    if not resource_path:
+        return JsonResponse({"ok": False, "error": "path cannot be empty"}, status=400)
+    if not resource_path.startswith("/"):
+        resource_path = f"/{resource_path}"
+
+    query = payload.get("query", {})
+    if query is None:
+        query = {}
+    if not isinstance(query, dict):
+        return JsonResponse({"ok": False, "error": "query must be a JSON object"}, status=400)
+
+    outbound_content_type = str(
+        payload.get("content_type")
+        or request.headers.get("Content-Type")
+        or "application/json"
+    ).strip()
+    request_body = _as_request_body_bytes(payload.get("body"), outbound_content_type)
+
+    if (
+        channel.requires_request_body
+        and method not in {"GET", "HEAD", "OPTIONS"}
+        and len(request_body) == 0
+    ):
+        correlation_id = Transaction._meta.get_field("correlation_id").default()
+        target_url = _build_target_url_from_parts(channel, resource_path, query)
+        Transaction.objects.create(
+            correlation_id=correlation_id,
+            channel=channel,
+            client=client,
+            status=Transaction.Status.FAILED,
+            request_method=method,
+            request_url=target_url,
+            request_headers=_loggable_request_headers(request),
+            request_body="",
+            error_message="Channel requires request body",
+            completed_at=timezone.now(),
+        )
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Request body is required for this channel",
+                "correlation_id": str(correlation_id),
+            },
+            status=400,
+        )
+
+    if channel.request_content_type and len(request_body) > 0:
+        incoming_content_type = _normalize_content_type(outbound_content_type)
+        expected_content_type = _normalize_content_type(channel.request_content_type)
+        if incoming_content_type != expected_content_type:
+            correlation_id = Transaction._meta.get_field("correlation_id").default()
+            target_url = _build_target_url_from_parts(channel, resource_path, query)
+            Transaction.objects.create(
+                correlation_id=correlation_id,
+                channel=channel,
+                client=client,
+                status=Transaction.Status.FAILED,
+                request_method=method,
+                request_url=target_url,
+                request_headers=_loggable_request_headers(request),
+                request_body=_truncate_text(request_body),
+                error_message=(
+                    "Unsupported content type. "
+                    f"Expected {channel.request_content_type}"
+                ),
+                completed_at=timezone.now(),
+            )
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": (
+                        "Unsupported content type for this channel. "
+                        f"Expected {channel.request_content_type}"
+                    ),
+                    "correlation_id": str(correlation_id),
+                },
+                status=415,
+            )
+
+    organization = payload.get("organization", "")
+    registration, registration_error = _resolve_external_registration(
+        request,
+        channel,
+        organization_override=organization,
+    )
+    if registration_error is not None:
+        return registration_error
+
+    target_url = (
+        settings.GOVESB_ENGINE_URL.rstrip("/") or "esb://unconfigured"
+        if registration is not None
+        else _build_target_url_from_parts(channel, resource_path, query)
+    )
+    async_requested = _looks_true(payload.get("async", False))
+    correlation_id = Transaction._meta.get_field("correlation_id").default()
+
+    transaction = Transaction.objects.create(
+        correlation_id=correlation_id,
+        channel=channel,
+        client=client,
+        status=Transaction.Status.PENDING if async_requested else Transaction.Status.PROCESSING,
+        request_method=method,
+        request_url=target_url,
+        request_headers=_loggable_request_headers(request),
+        request_body=_truncate_text(request_body),
+    )
+
+    provided_headers = payload.get("headers", {})
+    if provided_headers is None:
+        provided_headers = {}
+    if not isinstance(provided_headers, dict):
+        return JsonResponse({"ok": False, "error": "headers must be a JSON object"}, status=400)
+    source_headers = {str(key): str(value) for key, value in provided_headers.items()}
+    source_headers.setdefault("Content-Type", outbound_content_type)
+    proxy_headers = _proxy_headers_from_mapping(source_headers, transaction.correlation_id)
+
+    if async_requested:
+        esb_mode = None
+        esb_code = None
+        esb_payload = None
+
+        if registration is not None:
+            try:
+                esb_payload = _build_esb_payload(request_body)
+                esb_mode, esb_code = _resolve_esb_mode_and_code(
+                    request,
+                    registration,
+                    esb_mode_override=payload.get("esb_mode", ""),
+                )
+            except ValueError as exc:
+                transaction.status = Transaction.Status.FAILED
+                transaction.response_status_code = 400
+                transaction.error_message = str(exc)
+                transaction.completed_at = timezone.now()
+                transaction.save(
+                    update_fields=[
+                        "status",
+                        "response_status_code",
+                        "error_message",
+                        "completed_at",
+                    ]
+                )
+                return JsonResponse(
+                    {
+                        "ok": False,
+                        "error": str(exc),
+                        "correlation_id": str(transaction.correlation_id),
+                    },
+                    status=400,
+                )
+
+        try:
+            _submit_async_transaction(
+                transaction_id=transaction.id,
+                target_url=target_url,
+                request_method=method,
+                request_body=request_body,
+                proxy_headers=proxy_headers,
+                esb_mode=esb_mode,
+                esb_code=esb_code,
+                esb_payload=esb_payload,
+            )
+        except Exception as exc:  # pragma: no cover - depends on runtime threading state
+            transaction.status = Transaction.Status.FAILED
+            transaction.response_status_code = 500
+            transaction.error_message = f"Failed to queue async request: {exc}"
+            transaction.completed_at = timezone.now()
+            transaction.save(
+                update_fields=[
+                    "status",
+                    "response_status_code",
+                    "error_message",
+                    "completed_at",
+                ]
+            )
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": "Failed to queue async request",
+                    "correlation_id": str(transaction.correlation_id),
+                },
+                status=500,
+            )
+
+        status_url = reverse(
+            "mediator:transaction-status",
+            kwargs={"correlation_id": str(transaction.correlation_id)},
+        )
+        response = JsonResponse(
+            {
+                "ok": True,
+                "accepted": True,
+                "message": "Request accepted for asynchronous processing",
+                "correlation_id": str(transaction.correlation_id),
+                "status_url": status_url,
+            },
+            status=202,
+        )
+        response["Location"] = status_url
+        response["Preference-Applied"] = "respond-async"
+        response["X-Correlation-Id"] = str(transaction.correlation_id)
+        return response
+
+    if registration is not None:
+        try:
+            esb_payload = _build_esb_payload(request_body)
+            esb_mode, esb_code = _resolve_esb_mode_and_code(
+                request,
+                registration,
+                esb_mode_override=payload.get("esb_mode", ""),
+            )
+            esb_client = _build_esb_client()
+            data_format = _resolve_esb_data_format()
+
+            if esb_mode == "push":
+                esb_result = esb_client.push_data(
+                    push_code=esb_code,
+                    req_body=esb_payload,
+                    data_format=data_format,
+                )
+                if isinstance(esb_result, tuple):
+                    response_data, success = esb_result
+                else:
+                    response_data, success = esb_result, True
+            else:
+                response_data, success = esb_client.request_data(
+                    api_code=esb_code,
+                    req_body=esb_payload,
+                    data_format=data_format,
+                )
+        except ValueError as exc:
+            transaction.status = Transaction.Status.FAILED
+            transaction.response_status_code = 400
+            transaction.error_message = str(exc)
+            transaction.completed_at = timezone.now()
+            transaction.save(
+                update_fields=[
+                    "status",
+                    "response_status_code",
+                    "error_message",
+                    "completed_at",
+                ]
+            )
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": str(exc),
+                    "correlation_id": str(transaction.correlation_id),
+                },
+                status=400,
+            )
+        except Exception as exc:
+            transaction.status = Transaction.Status.FAILED
+            transaction.response_status_code = 502
+            transaction.error_message = str(exc)
+            transaction.completed_at = timezone.now()
+            transaction.save(
+                update_fields=[
+                    "status",
+                    "response_status_code",
+                    "error_message",
+                    "completed_at",
+                ]
+            )
+            return JsonResponse(
+                {
+                    "ok": False,
+                    "error": "Failed to relay request via national ESB",
+                    "correlation_id": str(transaction.correlation_id),
+                },
+                status=502,
+            )
+
+        response_payload, response_text = _normalize_esb_response(response_data)
+        response_status_code = 200 if success else 502
+        transaction.response_status_code = response_status_code
+        transaction.response_headers = {"Content-Type": "application/json"}
+        transaction.response_body = _truncate_text(response_text)
+        transaction.completed_at = timezone.now()
+        if success:
+            transaction.status = Transaction.Status.SUCCESSFUL
+            transaction.error_message = ""
+        else:
+            transaction.status = Transaction.Status.FAILED
+            transaction.error_message = "National ESB returned an unsuccessful response"
+        transaction.save(
+            update_fields=[
+                "status",
+                "response_status_code",
+                "response_headers",
+                "response_body",
+                "error_message",
+                "completed_at",
+            ]
+        )
+
+        response = JsonResponse(
+            response_payload,
+            safe=not isinstance(response_payload, list),
+            status=response_status_code,
+        )
+        response["X-Correlation-Id"] = str(transaction.correlation_id)
+        return response
+
+    upstream_request = urllib.request.Request(
+        target_url,
+        data=(request_body if request_body else None),
+        headers=proxy_headers,
+        method=method,
+    )
+
+    response_status_code = None
+    response_headers = {}
+    response_body = b""
+
+    try:
+        with urllib.request.urlopen(
+            upstream_request,
+            timeout=settings.MEDIATOR_FORWARD_TIMEOUT,
+        ) as upstream_response:
+            response_status_code = upstream_response.getcode()
+            response_headers = dict(upstream_response.headers.items())
+            response_body = upstream_response.read()
+    except urllib.error.HTTPError as exc:
+        response_status_code = exc.code
+        response_headers = dict(exc.headers.items()) if exc.headers else {}
+        response_body = exc.read()
+    except UPSTREAM_NETWORK_EXCEPTIONS as exc:
+        transaction.status = Transaction.Status.FAILED
+        transaction.response_status_code = 502
+        transaction.error_message = str(exc)
+        transaction.completed_at = timezone.now()
+        transaction.save(
+            update_fields=[
+                "status",
+                "response_status_code",
+                "error_message",
+                "completed_at",
+            ]
+        )
+        return JsonResponse(
+            {
+                "ok": False,
+                "error": "Failed to reach mediator endpoint",
+                "correlation_id": str(transaction.correlation_id),
+            },
+            status=502,
+        )
+
+    transaction.response_status_code = response_status_code
+    transaction.response_headers = _safe_response_headers(response_headers)
+    transaction.response_body = _truncate_text(response_body)
+    transaction.completed_at = timezone.now()
+
+    if 200 <= response_status_code < 400:
+        transaction.status = Transaction.Status.SUCCESSFUL
+        transaction.error_message = ""
+    else:
+        transaction.status = Transaction.Status.FAILED
+        transaction.error_message = f"Upstream returned HTTP {response_status_code}"
+
+    transaction.save(
+        update_fields=[
+            "status",
+            "response_status_code",
+            "response_headers",
+            "response_body",
+            "error_message",
+            "completed_at",
+        ]
+    )
+
+    response = HttpResponse(response_body, status=response_status_code)
+    for key, value in response_headers.items():
+        lowered = key.lower()
+        if lowered in HOP_BY_HOP_HEADERS:
+            continue
+        if lowered in {"content-length", "connection", "transfer-encoding"}:
+            continue
+        response[key] = value
+
+    response["X-Correlation-Id"] = str(transaction.correlation_id)
+    return response
 
 
 @swagger_doc(
@@ -1119,7 +1653,7 @@ def proxy_request(request, resource_path=""):
         response_headers = dict(exc.headers.items()) if exc.headers else {}
         response_body = exc.read()
 
-    except (urllib.error.URLError, TimeoutError, socket.timeout) as exc:
+    except UPSTREAM_NETWORK_EXCEPTIONS as exc:
         transaction.status = Transaction.Status.FAILED
         transaction.response_status_code = 502
         transaction.error_message = str(exc)

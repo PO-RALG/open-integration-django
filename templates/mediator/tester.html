@@ -42,16 +42,81 @@
       border-radius: 8px;
       padding: 12px;
       overflow: auto;
-      min-height: 320px;
+      height: 220px;
+      max-height: 220px;
       margin: 0;
       font-size: 12px;
       line-height: 1.5;
+    }
+
+    .tester-page .response-panel .card-body {
+      height: 520px;
+      max-height: 520px;
+      overflow-y: auto;
+      overflow-x: hidden;
+    }
+
+    .tester-page .error-tv {
+      display: none;
+      margin-bottom: 12px;
+      border-radius: 14px;
+      padding: 10px;
+      background: linear-gradient(140deg, #1f2937, #111827);
+      box-shadow: inset 0 0 0 2px #374151, 0 10px 18px rgba(15, 23, 42, 0.28);
+    }
+
+    .tester-page .error-tv-label {
+      color: #d1d5db;
+      font-size: 11px;
+      letter-spacing: 0.03em;
+      margin-bottom: 6px;
+      font-weight: 700;
+      text-transform: uppercase;
+    }
+
+    .tester-page .error-tv-screen {
+      position: relative;
+      border-radius: 10px;
+      overflow: hidden;
+      background: #020617;
+      border: 1px solid #334155;
+      height: 160px;
+      max-height: 160px;
+    }
+
+    .tester-page .error-tv-screen::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      pointer-events: none;
+      background: repeating-linear-gradient(
+        to bottom,
+        rgba(148, 163, 184, 0.06) 0,
+        rgba(148, 163, 184, 0.06) 1px,
+        transparent 2px,
+        transparent 4px
+      );
+    }
+
+    .tester-page .error-tv-frame {
+      width: 100%;
+      height: 100%;
+      border: 0;
+      background: #ffffff;
     }
 
     .tester-page textarea {
       min-height: 110px;
       resize: vertical;
       font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    }
+
+    @media (max-width: 991.98px) {
+      .tester-page .response-panel .card-body {
+        height: auto;
+        max-height: none;
+        overflow: visible;
+      }
     }
   </style>
 {% endblock %}
@@ -125,12 +190,18 @@
     </div>
 
     <div class="col-lg-6">
-      <div class="card card-secondary card-outline">
+      <div class="card card-secondary card-outline response-panel">
         <div class="card-header">
           <h3 class="card-title">Response</h3>
         </div>
         <div class="card-body">
           <div id="statusLine" class="status">Ready</div>
+          <div id="errorTv" class="error-tv" aria-live="polite">
+            <div class="error-tv-label">HTML Error Preview</div>
+            <div class="error-tv-screen">
+              <iframe id="errorTvFrame" class="error-tv-frame" sandbox="allow-same-origin"></iframe>
+            </div>
+          </div>
           <pre id="responseOutput">No request sent yet.</pre>
         </div>
       </div>
@@ -157,7 +228,70 @@
   const sendBtn = document.getElementById("sendBtn");
   const statusLine = document.getElementById("statusLine");
   const responseOutput = document.getElementById("responseOutput");
+  const errorTv = document.getElementById("errorTv");
+  const errorTvFrame = document.getElementById("errorTvFrame");
   const channelHints = document.getElementById("channelHints");
+  let errorTvBlobUrl = "";
+
+  function looksLikeHtml(text) {
+    const probe = String(text || "").trim().toLowerCase();
+    return (
+      probe.startsWith("<!doctype html") ||
+      probe.startsWith("<html") ||
+      probe.includes("<!doctype html") ||
+      probe.includes("<head") ||
+      probe.includes("<body")
+    );
+  }
+
+  function extractHtmlFromValue(value) {
+    if (typeof value === "string" && looksLikeHtml(value)) {
+      return value;
+    }
+    if (Array.isArray(value)) {
+      for (const item of value) {
+        const nested = extractHtmlFromValue(item);
+        if (nested) {
+          return nested;
+        }
+      }
+      return "";
+    }
+    if (value && typeof value === "object") {
+      for (const key of Object.keys(value)) {
+        const nested = extractHtmlFromValue(value[key]);
+        if (nested) {
+          return nested;
+        }
+      }
+    }
+    return "";
+  }
+
+  function setHtmlErrorPreview(visible, htmlText) {
+    if (errorTvBlobUrl) {
+      URL.revokeObjectURL(errorTvBlobUrl);
+      errorTvBlobUrl = "";
+    }
+
+    if (!visible) {
+      errorTv.style.display = "none";
+      errorTvFrame.srcdoc = "";
+      errorTvFrame.removeAttribute("src");
+      return;
+    }
+
+    errorTv.style.display = "block";
+    const html = String(htmlText || "");
+    if ("srcdoc" in errorTvFrame) {
+      errorTvFrame.srcdoc = html;
+      errorTvFrame.removeAttribute("src");
+      return;
+    }
+    const blob = new Blob([html], { type: "text/html" });
+    errorTvBlobUrl = URL.createObjectURL(blob);
+    errorTvFrame.src = errorTvBlobUrl;
+  }
 
   function renderChannelOptions() {
     channelSelect.innerHTML = "";
@@ -313,12 +447,35 @@
 
       const elapsedMs = Math.round(performance.now() - started);
       const text = await response.text();
+      const contentType = String(response.headers.get("content-type") || "").toLowerCase();
+      let htmlPreviewText = "";
+      const isRawHtml = contentType.includes("text/html") || looksLikeHtml(text);
+      if (isRawHtml) {
+        htmlPreviewText = text;
+      }
       let parsedBody = text;
+      let parsedJson = null;
 
       try {
-        parsedBody = JSON.stringify(JSON.parse(text), null, 2);
+        parsedJson = JSON.parse(text);
+        parsedBody = JSON.stringify(parsedJson, null, 2);
       } catch (_err) {
         // Keep raw text if it is not JSON.
+      }
+
+      if (!htmlPreviewText && parsedJson) {
+        htmlPreviewText = extractHtmlFromValue(parsedJson);
+      }
+
+      if (!response.ok && htmlPreviewText) {
+        const compactBody = String(htmlPreviewText || "").replace(/\s+/g, " ").trim();
+        const snippet = compactBody.slice(0, 1200);
+        parsedBody = [
+          "[HTML error preview rendered above]",
+          "",
+          "Body snippet:",
+          snippet + (compactBody.length > snippet.length ? "...<truncated>" : ""),
+        ].join("\n");
       }
 
       const responseHeaders = {};
@@ -328,6 +485,7 @@
 
       statusLine.textContent = `${response.status} ${response.statusText} in ${elapsedMs}ms`;
       statusLine.className = response.ok ? "status ok" : "status fail";
+      setHtmlErrorPreview(!response.ok && Boolean(htmlPreviewText), htmlPreviewText);
 
       responseOutput.textContent = [
         "Request",
@@ -344,6 +502,7 @@
     } catch (err) {
       statusLine.textContent = "Request failed";
       statusLine.className = "status fail";
+      setHtmlErrorPreview(false, "");
       responseOutput.textContent = String(err);
     } finally {
       sendBtn.disabled = false;

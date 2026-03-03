@@ -74,6 +74,8 @@ class MediatorEndpointTests(TestCase):
             "ACCOUNT_ROLE_CHANGED",
         )
         self.assertIn("recipients", emit_json_body["example"])
+        self.assertIn("/integration/call", schema_payload["paths"])
+        self.assertIn("post", schema_payload["paths"]["/integration/call"])
         self.assertIn("/transactions/{correlation_id}/", schema_payload["paths"])
 
         ui_response = self.client.get("/api/docs/swagger/")
@@ -313,6 +315,65 @@ class ProxyLayerTests(TestCase):
         headers["HTTP_X_ORGANIZATION"] = organization
         return headers
 
+    def test_integration_call_requires_channel_id(self):
+        response = self.client.post(
+            "/integration/call",
+            data='{"body":{"teacher_id":"T-1"}}',
+            content_type="application/json",
+            **self._auth_headers(),
+        )
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("channel_id", response.json()["error"])
+
+    @patch("mediator.views.urllib.request.urlopen")
+    def test_integration_call_forwards_by_channel_id(self, mock_urlopen):
+        mock_urlopen.return_value = DummyUpstreamResponse(
+            status=201,
+            body=b'{"ok": true, "message": "created"}',
+            headers={"Content-Type": "application/json", "X-Upstream": "demo"},
+        )
+
+        response = self.client.post(
+            "/integration/call",
+            data=json.dumps(
+                {
+                    "channel_id": self.channel.id,
+                    "method": "POST",
+                    "path": "/integrations/teachers",
+                    "body": {"teacher_id": "T-1"},
+                    "headers": {"X-Request-Source": "wrapper"},
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response["X-Upstream"], "demo")
+        self.assertIn("X-Correlation-Id", response)
+        tx = Transaction.objects.latest("started_at")
+        self.assertEqual(tx.channel, self.channel)
+        self.assertEqual(tx.request_method, "POST")
+        self.assertIn("/integrations/teachers", tx.request_url)
+        self.assertIn("/integrations/teachers", mock_urlopen.call_args.args[0].full_url)
+
+    def test_integration_call_enforces_channel_method(self):
+        response = self.client.post(
+            "/integration/call",
+            data=json.dumps(
+                {
+                    "channel_id": self.channel.id,
+                    "method": "GET",
+                    "path": "/integrations/teachers",
+                    "body": {"teacher_id": "T-1"},
+                }
+            ),
+            content_type="application/json",
+            **self._auth_headers(),
+        )
+        self.assertEqual(response.status_code, 405)
+        self.assertIn("Method not allowed", response.json()["error"])
+
     def test_proxy_requires_authentication(self):
         response = self.client.post(
             "/integrations/teachers",
@@ -412,6 +473,21 @@ class ProxyLayerTests(TestCase):
     @patch("mediator.views.urllib.request.urlopen")
     def test_proxy_handles_upstream_connection_error(self, mock_urlopen):
         mock_urlopen.side_effect = urllib.error.URLError("connection refused")
+
+        response = self.client.post(
+            "/integrations/teachers",
+            data="{\"teacher_id\": \"T-1\"}",
+            content_type="application/json",
+            **self._auth_headers(),
+        )
+
+        self.assertEqual(response.status_code, 502)
+        tx = Transaction.objects.latest("started_at")
+        self.assertEqual(tx.status, Transaction.Status.FAILED)
+
+    @patch("mediator.views.urllib.request.urlopen")
+    def test_proxy_handles_connection_reset_error(self, mock_urlopen):
+        mock_urlopen.side_effect = ConnectionResetError("Connection reset by peer")
 
         response = self.client.post(
             "/integrations/teachers",
